@@ -1,0 +1,308 @@
+
+pipeline {
+    agent any
+
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        choice(
+            name: 'Environment',
+            choices: ['dev', 'qa', 'uat', 'prod'],
+            description: 'Select the environment'
+        )
+
+        choice(
+            name: 'Terraform_Action',
+            choices: ['init', 'plan', 'apply', 'destroy'],
+            description: 'Select the Terraform action'
+        )
+
+        booleanParam(
+            name: 'Auto_Approve',
+            defaultValue: false,
+            description: 'Skip manual approval for apply/destroy'
+        )
+    }
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        AWS_DEFAULT_REGION = 'us-east-1'
+        TF_IN_AUTOMATION = 'true'
+        AWS_ACCOUNT_ID = '020048087135'
+        EKS_CLUSTER_NAME = 'employee-mgm-dev-cluster'
+        AWS_ROLE_NAME = 'GitHubActions-EKS-Terraform-Role'
+    }
+
+    stages {
+        stage('Checkout Repository') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Verify Tools') {
+            steps {
+                sh '''
+                    echo "Checking installed tools..."
+                    aws --version
+                    terraform version
+                '''
+            }
+        }
+
+        stage('AWS Authentication') {
+            steps {
+                withAWS(
+                    role: "${AWS_ROLE_NAME}",
+                    roleAccount: "${AWS_ACCOUNT_ID}",
+                    region: "${AWS_REGION}",
+                    roleSessionName: 'JenkinsTerraform'
+                ) {
+                    sh '''
+                        echo "Verifying AWS Identity..."
+                        aws sts get-caller-identity
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Approval') {
+            when {
+                expression {
+                    (params.Terraform_Action == 'apply' ||
+                     params.Terraform_Action == 'destroy') &&
+                    !params.Auto_Approve
+                }
+            }
+            steps {
+                script {
+                    input(
+                        message: "Approve Terraform ${params.Terraform_Action} for ${params.Environment}?",
+                        ok: 'Approve and Continue'
+                    )
+                }
+            }
+        }
+
+        stage('Terraform Init') {
+            steps {
+                withAWS(
+                    role: "${AWS_ROLE_NAME}",
+                    roleAccount: "${AWS_ACCOUNT_ID}",
+                    region: "${AWS_REGION}",
+                    roleSessionName: 'JenkinsTerraform'
+                ) {
+                    sh """
+                        terraform init -reconfigure \\
+                            -backend-config="backend_conf/backend_${params.Environment}.conf"
+                    """
+                }
+            }
+        }
+
+        stage('Terraform Validate') {
+            when {
+                expression {
+                    params.Terraform_Action == 'plan' ||
+                    params.Terraform_Action == 'apply'
+                }
+            }
+            steps {
+                withAWS(
+                    role: "${AWS_ROLE_NAME}",
+                    roleAccount: "${AWS_ACCOUNT_ID}",
+                    region: "${AWS_REGION}",
+                    roleSessionName: 'JenkinsTerraform'
+                ) {
+                    sh 'terraform validate'
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            when {
+                expression {
+                    params.Terraform_Action == 'plan'
+                }
+            }
+            steps {
+                withAWS(
+                    role: "${AWS_ROLE_NAME}",
+                    roleAccount: "${AWS_ACCOUNT_ID}",
+                    region: "${AWS_REGION}",
+                    roleSessionName: 'JenkinsTerraform'
+                ) {
+                    sh """
+                        terraform plan \\
+                            -var-file="env/${params.Environment}.tfvars"
+                    """
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            when {
+                expression {
+                    params.Terraform_Action == 'apply'
+                }
+            }
+            steps {
+                withAWS(
+                    role: "${AWS_ROLE_NAME}",
+                    roleAccount: "${AWS_ACCOUNT_ID}",
+                    region: "${AWS_REGION}",
+                    roleSessionName: 'JenkinsTerraform'
+                ) {
+                    sh """
+                        terraform apply \\
+                            -var-file="env/${params.Environment}.tfvars" \\
+                            -auto-approve
+                    """
+                }
+            }
+        }
+
+        stage('Wait for EKS Cluster') {
+            when {
+                expression {
+                    params.Terraform_Action == 'apply' &&
+                    params.Environment == 'dev'
+                }
+            }
+            steps {
+                withAWS(
+                    role: "${AWS_ROLE_NAME}",
+                    roleAccount: "${AWS_ACCOUNT_ID}",
+                    region: "${AWS_REGION}",
+                    roleSessionName: 'JenkinsTerraform'
+                ) {
+                    timeout(time: 20, unit: 'MINUTES') {
+                        sh '''
+                            aws eks wait cluster-active \
+                                --name "$EKS_CLUSTER_NAME" \
+                                --region "$AWS_REGION"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Verify EKS Cluster') {
+            when {
+                expression {
+                    params.Terraform_Action == 'apply' &&
+                    params.Environment == 'dev'
+                }
+            }
+            steps {
+                withAWS(
+                    role: "${AWS_ROLE_NAME}",
+                    roleAccount: "${AWS_ACCOUNT_ID}",
+                    region: "${AWS_REGION}",
+                    roleSessionName: 'JenkinsTerraform'
+                ) {
+                    sh '''
+                        aws eks describe-cluster \
+                            --name "$EKS_CLUSTER_NAME" \
+                            --region "$AWS_REGION" \
+                            --query 'cluster.{Name:name,Status:status}' \
+                            --output table
+                    '''
+                }
+            }
+        }
+
+        stage('Configure kubectl') {
+            when {
+                expression {
+                    params.Terraform_Action == 'apply' &&
+                    params.Environment == 'dev'
+                }
+            }
+            steps {
+                withAWS(
+                    role: "${AWS_ROLE_NAME}",
+                    roleAccount: "${AWS_ACCOUNT_ID}",
+                    region: "${AWS_REGION}",
+                    roleSessionName: 'JenkinsTerraform'
+                ) {
+                    sh '''
+                        aws eks update-kubeconfig \
+                            --name "$EKS_CLUSTER_NAME" \
+                            --region "$AWS_REGION"
+                    '''
+                }
+            }
+        }
+
+        stage('Verify EKS Access') {
+            when {
+                expression {
+                    params.Terraform_Action == 'apply' &&
+                    params.Environment == 'dev'
+                }
+            }
+            steps {
+                sh '''
+                    echo "Checking EKS Nodes..."
+                    kubectl get nodes
+
+                    echo "Checking Kubernetes Namespaces..."
+                    kubectl get namespaces
+                '''
+            }
+        }
+
+        stage('Terraform Destroy') {
+            when {
+                expression {
+                    params.Terraform_Action == 'destroy'
+                }
+            }
+            steps {
+                withAWS(
+                    role: "${AWS_ROLE_NAME}",
+                    roleAccount: "${AWS_ACCOUNT_ID}",
+                    region: "${AWS_REGION}",
+                    roleSessionName: 'JenkinsTerraform'
+                ) {
+                    sh """
+                        terraform destroy \\
+                            -var-file="env/${params.Environment}.tfvars" \\
+                            -auto-approve
+                    """
+                }
+            }
+        }
+
+        stage('Terraform Init Completed') {
+            when {
+                expression {
+                    params.Terraform_Action == 'init'
+                }
+            }
+            steps {
+                echo 'Terraform initialization completed successfully.'
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Terraform pipeline completed successfully.'
+        }
+
+        failure {
+            echo 'Terraform pipeline failed. Check the Jenkins console output.'
+        }
+
+        always {
+            echo 'Terraform pipeline execution finished.'
+        }
+    }
+}
+
