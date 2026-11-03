@@ -26,13 +26,44 @@ pipeline {
         stage('Validate Parameters') {
             steps {
                 script {
-                    if (!params.ENVIRONMENT) {
+                    if (!params.ENVIRONMENT?.trim()) {
                         error('ENVIRONMENT must be selected.')
                     }
 
-                    if (!params.ACTION) {
+                    if (!params.ACTION?.trim()) {
                         error('ACTION must be selected.')
                     }
+
+                    env.TF_ENVIRONMENT = params.ENVIRONMENT
+                    env.TF_ACTION = params.ACTION
+                }
+
+                echo "Selected Environment: ${params.ENVIRONMENT}"
+                echo "Selected Action: ${params.ACTION}"
+            }
+        }
+
+        stage('Verify AWS Access') {
+            steps {
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: "${AWS_CRED}"]
+                ]) {
+                    sh '''
+                        set -e
+                        set +x
+
+                        export AWS_DEFAULT_REGION="$AWS_REGION"
+
+                        echo "=========================================="
+                        echo "Verifying AWS Identity"
+                        echo "=========================================="
+
+                        aws sts get-caller-identity
+
+                        echo "AWS authentication successful"
+                        echo "=========================================="
+                    '''
                 }
             }
         }
@@ -45,30 +76,40 @@ pipeline {
                 ]) {
                     sh '''
                         set -e
+                        set +x
 
                         export AWS_DEFAULT_REGION="$AWS_REGION"
 
-                        BACKEND_CONFIG="backend_conf/backend_${ENVIRONMENT}.conf"
-                        TFVARS_FILE="env/${ENVIRONMENT}.tfvars"
-
-                        if [ ! -f "$BACKEND_CONFIG" ]; then
-                            echo "ERROR: Backend configuration not found: $BACKEND_CONFIG"
-                            exit 1
-                        fi
-
-                        if [ ! -f "$TFVARS_FILE" ]; then
-                            echo "ERROR: Terraform variable file not found: $TFVARS_FILE"
-                            exit 1
-                        fi
+                        BACKEND_CONFIG="backend_conf/backend_${TF_ENVIRONMENT}.conf"
+                        TFVARS_FILE="env/${TF_ENVIRONMENT}.tfvars"
 
                         echo "=========================================="
-                        echo "Terraform Environment : ${ENVIRONMENT}"
-                        echo "Terraform Action      : ${ACTION}"
+                        echo "Terraform Environment : ${TF_ENVIRONMENT}"
+                        echo "Terraform Action      : ${TF_ACTION}"
                         echo "Terraform Backend     : ${BACKEND_CONFIG}"
                         echo "Terraform Variables   : ${TFVARS_FILE}"
                         echo "=========================================="
 
-                        rm -rf .terraform
+                        echo "Checking backend configuration..."
+
+                        if [ ! -f "$BACKEND_CONFIG" ]; then
+                            echo "ERROR: Backend configuration not found: $BACKEND_CONFIG"
+                            echo "Current directory: $(pwd)"
+                            echo "Available backend files:"
+                            ls -la backend_conf/ || true
+                            exit 1
+                        fi
+
+                        echo "Checking Terraform variables file..."
+
+                        if [ ! -f "$TFVARS_FILE" ]; then
+                            echo "ERROR: Terraform variable file not found: $TFVARS_FILE"
+                            echo "Available variable files:"
+                            ls -la env/ || true
+                            exit 1
+                        fi
+
+                        echo "Initializing Terraform backend..."
 
                         terraform init \
                             -input=false \
@@ -86,7 +127,12 @@ pipeline {
             steps {
                 sh '''
                     set -e
-                    terraform fmt -recursive
+
+                    echo "Checking Terraform formatting..."
+
+                    terraform fmt -check -recursive
+
+                    echo "Terraform formatting check passed"
                 '''
             }
         }
@@ -95,7 +141,12 @@ pipeline {
             steps {
                 sh '''
                     set -e
+
+                    echo "Validating Terraform configuration..."
+
                     terraform validate
+
+                    echo "Terraform validation completed successfully"
                 '''
             }
         }
@@ -113,17 +164,22 @@ pipeline {
                 ]) {
                     sh '''
                         set -e
+                        set +x
 
                         export AWS_DEFAULT_REGION="$AWS_REGION"
 
+                        TFVARS_FILE="env/${TF_ENVIRONMENT}.tfvars"
+
+                        echo "Creating Terraform execution plan..."
+
                         terraform plan \
                             -input=false \
-                            -var-file="env/${ENVIRONMENT}.tfvars" \
-                            -out="tfplan-${ENVIRONMENT}"
+                            -var-file="$TFVARS_FILE" \
+                            -out="tfplan-${TF_ENVIRONMENT}"
 
                         echo "=========================================="
                         echo "Terraform plan completed successfully"
-                        echo "Environment: ${ENVIRONMENT}"
+                        echo "Environment: ${TF_ENVIRONMENT}"
                         echo "=========================================="
                     '''
                 }
@@ -157,17 +213,20 @@ pipeline {
                 ]) {
                     sh '''
                         set -e
+                        set +x
 
                         export AWS_DEFAULT_REGION="$AWS_REGION"
+
+                        echo "Applying Terraform execution plan..."
 
                         terraform apply \
                             -input=false \
                             -auto-approve \
-                            "tfplan-${ENVIRONMENT}"
+                            "tfplan-${TF_ENVIRONMENT}"
 
                         echo "=========================================="
                         echo "Terraform apply completed successfully"
-                        echo "Environment: ${ENVIRONMENT}"
+                        echo "Environment: ${TF_ENVIRONMENT}"
                         echo "=========================================="
                     '''
                 }
@@ -187,23 +246,26 @@ pipeline {
                 ]) {
                     sh '''
                         set -e
+                        set +x
 
                         export AWS_DEFAULT_REGION="$AWS_REGION"
 
+                        TFVARS_FILE="env/${TF_ENVIRONMENT}.tfvars"
+
                         echo "=========================================="
                         echo "WARNING: Terraform DESTROY PLAN"
-                        echo "Environment: ${ENVIRONMENT}"
+                        echo "Environment: ${TF_ENVIRONMENT}"
                         echo "=========================================="
 
                         terraform plan \
                             -destroy \
                             -input=false \
-                            -var-file="env/${ENVIRONMENT}.tfvars" \
-                            -out="destroy-${ENVIRONMENT}"
+                            -var-file="$TFVARS_FILE" \
+                            -out="destroy-${TF_ENVIRONMENT}"
 
                         echo "=========================================="
                         echo "Terraform destroy plan completed"
-                        echo "Environment: ${ENVIRONMENT}"
+                        echo "Environment: ${TF_ENVIRONMENT}"
                         echo "=========================================="
                     '''
                 }
@@ -237,17 +299,20 @@ pipeline {
                 ]) {
                     sh '''
                         set -e
+                        set +x
 
                         export AWS_DEFAULT_REGION="$AWS_REGION"
+
+                        echo "Executing Terraform destroy plan..."
 
                         terraform apply \
                             -input=false \
                             -auto-approve \
-                            "destroy-${ENVIRONMENT}"
+                            "destroy-${TF_ENVIRONMENT}"
 
                         echo "=========================================="
-                        echo "Terraform destroy completed"
-                        echo "Environment: ${ENVIRONMENT}"
+                        echo "Terraform destroy completed successfully"
+                        echo "Environment: ${TF_ENVIRONMENT}"
                         echo "=========================================="
                     '''
                 }
@@ -267,10 +332,14 @@ pipeline {
         always {
             echo "Terraform environment: ${params.ENVIRONMENT}"
 
-            sh '''
-                rm -f tfplan-${ENVIRONMENT} 2>/dev/null || true
-                rm -f destroy-${ENVIRONMENT} 2>/dev/null || true
-            '''
+            script {
+                if (params.ENVIRONMENT) {
+                    sh """
+                        rm -f "tfplan-${params.ENVIRONMENT}" 2>/dev/null || true
+                        rm -f "destroy-${params.ENVIRONMENT}" 2>/dev/null || true
+                    """
+                }
+            }
         }
     }
 }
