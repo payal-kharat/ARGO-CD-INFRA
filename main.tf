@@ -62,7 +62,7 @@ module "EKS_ADDONS" {
 }
 
 module "EKS" {
-  source = "./modules/EKS"
+  source              = "./modules/EKS"
   AWS_REGION          = var.AWS_REGION
   PROJECT_NAME        = var.PROJECT_NAME
   EKS_CLUSTER_NAME    = var.EKS_CLUSTER_NAME

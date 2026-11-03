@@ -1,5 +1,5 @@
-ENVIRONMENT  = "dev"
-AWS_REGION = "us-east-1"
+ENVIRONMENT = "dev"
+AWS_REGION  = "us-east-1"
 
 PROJECT_NAME         = "employee-mgm"
 VPC_CIDR             = "10.0.0.0/16"
