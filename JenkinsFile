@@ -2,153 +2,275 @@
 pipeline {
     agent any
 
-    options {
-        timestamps()
-        disableConcurrentBuilds()
-        skipDefaultCheckout(true)
-    }
-
     parameters {
         choice(
-            name: 'Environment',
+            name: 'ENVIRONMENT',
             choices: ['dev', 'qa', 'uat', 'prod'],
-            description: 'Select the environment'
+            description: 'Select the Terraform environment'
         )
         choice(
-            name: 'Terraform_Action',
-            choices: ['init', 'plan', 'apply', 'destroy'],
+            name: 'ACTION',
+            choices: ['PLAN', 'APPLY', 'DESTROY'],
             description: 'Select Terraform action'
         )
     }
 
     environment {
-        AWS_REGION = 'us-east-1'
-        AWS_DEFAULT_REGION = 'us-east-1'
+        AWS_REGION       = 'us-east-1'
+        AWS_CRED         = 'AWS'
         TF_IN_AUTOMATION = 'true'
+        TF_INPUT         = 'false'
     }
 
     stages {
-        stage('Checkout Repository') {
+        stage('Validate Parameters') {
             steps {
-                checkout scm
-            }
-        }
+                script {
+                    if (!params.ENVIRONMENT) {
+                        error('ENVIRONMENT must be selected.')
+                    }
 
-        stage('Verify AWS Access') {
-            steps {
-                sh '''
-                    echo "Verifying AWS Identity..."
-                    aws sts get-caller-identity
-                '''
+                    if (!params.ACTION) {
+                        error('ACTION must be selected.')
+                    }
+                }
             }
         }
 
         stage('Terraform Init') {
             steps {
-                sh """
-                    terraform init -reconfigure \\
-                        -backend-config="backend_conf/backend_${params.Environment}.conf"
-                """
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: "${AWS_CRED}"]
+                ]) {
+                    sh '''
+                        set -e
+
+                        export AWS_DEFAULT_REGION="$AWS_REGION"
+
+                        BACKEND_CONFIG="backend_conf/backend_${ENVIRONMENT}.conf"
+                        TFVARS_FILE="env/${ENVIRONMENT}.tfvars"
+
+                        if [ ! -f "$BACKEND_CONFIG" ]; then
+                            echo "ERROR: Backend configuration not found: $BACKEND_CONFIG"
+                            exit 1
+                        fi
+
+                        if [ ! -f "$TFVARS_FILE" ]; then
+                            echo "ERROR: Terraform variable file not found: $TFVARS_FILE"
+                            exit 1
+                        fi
+
+                        echo "=========================================="
+                        echo "Terraform Environment : ${ENVIRONMENT}"
+                        echo "Terraform Action      : ${ACTION}"
+                        echo "Terraform Backend     : ${BACKEND_CONFIG}"
+                        echo "Terraform Variables   : ${TFVARS_FILE}"
+                        echo "=========================================="
+
+                        rm -rf .terraform
+
+                        terraform init \
+                            -input=false \
+                            -reconfigure \
+                            -backend-config="$BACKEND_CONFIG"
+
+                        echo "Terraform backend initialized successfully"
+                        echo "=========================================="
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Format') {
+            steps {
+                sh '''
+                    set -e
+                    terraform fmt -recursive
+                '''
             }
         }
 
         stage('Terraform Validate') {
-            when {
-                expression {
-                    params.Terraform_Action == 'plan' ||
-                    params.Terraform_Action == 'apply'
-                }
-            }
             steps {
-                sh 'terraform validate'
+                sh '''
+                    set -e
+                    terraform validate
+                '''
             }
         }
 
         stage('Terraform Plan') {
             when {
                 expression {
-                    params.Terraform_Action == 'plan'
+                    return params.ACTION == 'PLAN' || params.ACTION == 'APPLY'
                 }
             }
             steps {
-                sh """
-                    terraform plan \\
-                        -var-file="env/${params.Environment}.tfvars"
-                """
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: "${AWS_CRED}"]
+                ]) {
+                    sh '''
+                        set -e
+
+                        export AWS_DEFAULT_REGION="$AWS_REGION"
+
+                        terraform plan \
+                            -input=false \
+                            -var-file="env/${ENVIRONMENT}.tfvars" \
+                            -out="tfplan-${ENVIRONMENT}"
+
+                        echo "=========================================="
+                        echo "Terraform plan completed successfully"
+                        echo "Environment: ${ENVIRONMENT}"
+                        echo "=========================================="
+                    '''
+                }
+            }
+        }
+
+        stage('Manual Approval - Apply') {
+            when {
+                expression {
+                    return params.ACTION == 'APPLY'
+                }
+            }
+            steps {
+                input(
+                    message: "Approve Terraform APPLY for ${params.ENVIRONMENT}?",
+                    ok: 'Approve Apply'
+                )
             }
         }
 
         stage('Terraform Apply') {
             when {
                 expression {
-                    params.Terraform_Action == 'apply'
+                    return params.ACTION == 'APPLY'
                 }
             }
             steps {
-                sh """
-                    terraform apply \\
-                        -var-file="env/${params.Environment}.tfvars" \\
-                        -auto-approve
-                """
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: "${AWS_CRED}"]
+                ]) {
+                    sh '''
+                        set -e
+
+                        export AWS_DEFAULT_REGION="$AWS_REGION"
+
+                        terraform apply \
+                            -input=false \
+                            -auto-approve \
+                            "tfplan-${ENVIRONMENT}"
+
+                        echo "=========================================="
+                        echo "Terraform apply completed successfully"
+                        echo "Environment: ${ENVIRONMENT}"
+                        echo "=========================================="
+                    '''
+                }
             }
         }
 
-        stage('Terraform Destroy Approval') {
+        stage('Terraform Destroy Plan') {
             when {
                 expression {
-                    params.Terraform_Action == 'destroy'
+                    return params.ACTION == 'DESTROY'
                 }
             }
             steps {
-                script {
-                    input(
-                        message: "Are you sure you want to DESTROY ${params.Environment} infrastructure?",
-                        ok: 'Approve Destroy',
-                        submitterParameter: 'APPROVED_BY'
-                    )
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: "${AWS_CRED}"]
+                ]) {
+                    sh '''
+                        set -e
+
+                        export AWS_DEFAULT_REGION="$AWS_REGION"
+
+                        echo "=========================================="
+                        echo "WARNING: Terraform DESTROY PLAN"
+                        echo "Environment: ${ENVIRONMENT}"
+                        echo "=========================================="
+
+                        terraform plan \
+                            -destroy \
+                            -input=false \
+                            -var-file="env/${ENVIRONMENT}.tfvars" \
+                            -out="destroy-${ENVIRONMENT}"
+
+                        echo "=========================================="
+                        echo "Terraform destroy plan completed"
+                        echo "Environment: ${ENVIRONMENT}"
+                        echo "=========================================="
+                    '''
                 }
+            }
+        }
+
+        stage('Manual Approval - Destroy') {
+            when {
+                expression {
+                    return params.ACTION == 'DESTROY'
+                }
+            }
+            steps {
+                input(
+                    message: "WARNING: Approve Terraform DESTROY for ${params.ENVIRONMENT}?",
+                    ok: 'Approve Destroy'
+                )
             }
         }
 
         stage('Terraform Destroy') {
             when {
                 expression {
-                    params.Terraform_Action == 'destroy'
+                    return params.ACTION == 'DESTROY'
                 }
             }
             steps {
-                sh """
-                    terraform destroy \\
-                        -var-file="env/${params.Environment}.tfvars" \\
-                        -auto-approve
-                """
-            }
-        }
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: "${AWS_CRED}"]
+                ]) {
+                    sh '''
+                        set -e
 
-        stage('Terraform Init Completed') {
-            when {
-                expression {
-                    params.Terraform_Action == 'init'
+                        export AWS_DEFAULT_REGION="$AWS_REGION"
+
+                        terraform apply \
+                            -input=false \
+                            -auto-approve \
+                            "destroy-${ENVIRONMENT}"
+
+                        echo "=========================================="
+                        echo "Terraform destroy completed"
+                        echo "Environment: ${ENVIRONMENT}"
+                        echo "=========================================="
+                    '''
                 }
-            }
-            steps {
-                echo 'Terraform initialization completed successfully.'
             }
         }
     }
 
     post {
         success {
-            echo 'Terraform infrastructure pipeline completed successfully.'
+            echo "Terraform ${params.ACTION} for ${params.ENVIRONMENT} completed successfully."
         }
+
         failure {
-            echo 'Terraform infrastructure pipeline failed. Check console output.'
+            echo "Terraform ${params.ACTION} for ${params.ENVIRONMENT} failed."
         }
-        aborted {
-            echo 'Terraform pipeline was aborted.'
-        }
+
         always {
-            echo 'Terraform pipeline execution finished.'
+            echo "Terraform environment: ${params.ENVIRONMENT}"
+
+            sh '''
+                rm -f tfplan-${ENVIRONMENT} 2>/dev/null || true
+                rm -f destroy-${ENVIRONMENT} 2>/dev/null || true
+            '''
         }
     }
 }
